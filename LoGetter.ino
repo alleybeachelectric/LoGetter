@@ -22,7 +22,9 @@
           Serial1.begin(9600, SERIAL_8N1, 7, 8);
     - Optional VBUS sense (recommended for car use):
           USB VBUS (5V) -> 100k -> GPIO34 -> 100k -> GND
-          Then set USE_VBUS_SENSE = 1 and tune VBUS_ON_THRESH after printing ADC values
+          Then set USE_VBUS_SENSE = 1 and tune VBUS_ON_MV/VBUS_OFF_MV after printing ADC values
+    - Battery voltage monitor:
+          Use the built in voltage divider on IO35 
     - NeoPixel: built-in on PIN_NEOPIXEL (GPIO0), power enable on NEOPIXEL_I2C_POWER (GPIO2)
 
   Requires:
@@ -30,8 +32,8 @@
     - LittleFS (ESP32 core)
     - secrets.h:
         #pragma once
-        #define WIFI_SSID      "BitcoinFarm"
-        #define WIFI_PASS      "..."
+        #define WIFI_SSID      "SSID"
+        #define WIFI_PASS      "DEADBEEF"
         #define INFLUX_TOKEN   "..."
 */
 
@@ -43,7 +45,7 @@
 #include "FS.h"
 #include "LittleFS.h"
 
-#include "secrets.local.h"
+#include "secrets.local.h"      // Rename as "secrets.h" cause I'm too lazy and will accidentally post my secrets.
 
 // =========================
 // InfluxDB v2 config
@@ -99,9 +101,36 @@ static const uint32_t LOG_PERIOD_MS = 1000;  // 1Hz
 
 // Trip end conditions
 // 1) Recommended: detect car USB removal (VBUS sense)
-static const int USE_VBUS_SENSE = 0;         // <-- set to 1 after you add the divider
-static const int VBUS_SENSE_PIN = 34;
-static const int VBUS_ON_THRESH = 600;       // tune with serial print
+//
+// Wiring (simple + robust):
+//   USB VBUS (5V) -> 10k -> GPIO34 (A2) -> 10k -> GND
+// This makes ~2.5V at the pin when VBUS is present.
+static const int USE_VBUS_SENSE = 1;          // set to 0 to disable VBUS sensing
+static const int VBUS_SENSE_PIN = 34;         // Feather ESP32 V2: A2 = GPIO34
+
+// Calibrated thresholds (mV at the ADC pin, *after* the divider):
+// Your readings: unplugged ~142 mV, plugged ~2560 mV.
+// Use a little hysteresis to avoid chatter.
+static const int VBUS_ON_MV  = 1500;          // consider VBUS "present" above this
+static const int VBUS_OFF_MV = 800;           // consider VBUS "gone" below this
+
+
+
+// =========================
+// Battery monitor (Feather ESP32 V2 LiPoly monitor)
+// =========================
+// Feather ESP32 V2 has a 200K/200K divider into GPIO35 (VOLTAGE_MONITOR).
+// Read the ADC pin and multiply by 2 to estimate battery voltage.
+static const int   USE_BATT_MONITOR = 1;
+static const int   BATT_MON_PIN     = 35;
+static const float BATT_DIVIDER     = 2.0f;
+
+// Basic sanity limits for a 1-cell LiPo
+static const float BATT_VALID_MIN_V = 2.80f;  // below this is likely bogus
+static const float BATT_VALID_MAX_V = 4.35f;  // above this is likely bogus
+
+// If readings jump around more than this across a short sample window, treat as floating/no-batt
+static const float BATT_JITTER_MAX_V = 0.25f;
 
 // 2) Dev fallback: end trip if "stopped" for N seconds
 static const float SPEED_STOP_MPH = 1.0f;
@@ -110,6 +139,7 @@ static const uint32_t STOP_HOLD_SEC = 120;   // 2 minutes
 // Wi-Fi + sleep
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 static const uint32_t SLEEP_SECONDS = 120;   // wake every 2 min and try again (if car off)
+
 
 // =========================
 // State
@@ -199,10 +229,17 @@ static bool ymdhms_to_epoch_ns(int y, int mo, int d, int hh, int mm, int ss, int
 // =========================
 // Power sense
 // =========================
+
 static bool carPowerPresent() {
-  if (!USE_VBUS_SENSE) return true; // cannot detect car USB removal in dev mode
-  int v = analogRead(VBUS_SENSE_PIN);
-  return v > VBUS_ON_THRESH;
+  if (!USE_VBUS_SENSE) return true;
+
+  static bool state = true;  // assume on at boot
+  uint32_t mv = analogReadMilliVolts(VBUS_SENSE_PIN);
+
+  if (state)  state = (mv > VBUS_OFF_MV);
+  else        state = (mv > VBUS_ON_MV);
+
+  return state;
 }
 
 // =========================
@@ -234,7 +271,7 @@ static String makeTripFilenameFromGPS() {
 
 static void writeHeaderIfNew(File &f) {
   if (f.size() == 0) {
-    f.println("utc_date,utc_time,fix,fixquality,sats,lat,lon,alt_m,speed_mph,course_deg,hdop,ttff_ms");
+    f.println("utc_date,utc_time,fix,fixquality,sats,lat,lon,alt_m,speed_mph,course_deg,hdop,batt_v,ttff_ms");
   }
 }
 
@@ -264,6 +301,57 @@ static void maybeRenameTripFile() {
 }
 
 // =========================
+// Battery level 
+// =========================
+
+static float readBatteryVoltage() {
+  if (!USE_BATT_MONITOR) return -1.0f;
+
+  // Take a few samples (ESP32 ADC can be noisy, and floating can look "high")
+  const int N = 6;
+  float vmin =  999.0f;
+  float vmax = -999.0f;
+  float sum  = 0.0f;
+
+  for (int i = 0; i < N; i++) {
+    float v;
+
+    #if defined(ARDUINO_ARCH_ESP32)
+      uint32_t mv = analogReadMilliVolts(BATT_MON_PIN); // mV at ADC pin
+      v = (mv / 1000.0f) * BATT_DIVIDER;                // undo divider
+    #else
+      int raw = analogRead(BATT_MON_PIN);               // 0..4095 @ 12-bit
+      float v_pin = (raw / 4095.0f) * 3.3f;
+      v = v_pin * BATT_DIVIDER;
+    #endif
+
+    sum += v;
+    if (v < vmin) vmin = v;
+    if (v > vmax) vmax = v;
+
+    
+    delay(2);
+    yield();
+  }
+
+  float avg = sum / (float)N;
+
+  // Reject obvious garbage
+  if (avg < BATT_VALID_MIN_V || avg > BATT_VALID_MAX_V) return -1.0f;
+
+  // Reject floating/no-battery behavior (usually unstable or pegged high)
+  if ((vmax - vmin) > BATT_JITTER_MAX_V) return -1.0f;
+
+  // With 1M bleeder, unplugged should be near 0V
+  if (avg < 1.0f) return -1.0f;
+
+  return avg;
+}
+
+
+
+
+// =========================
 // CSV logging
 // =========================
 static String buildCsvLine() {
@@ -287,6 +375,13 @@ static String buildCsvLine() {
   line += String(speed_mph, 2); line += ",";
   line += String(GPS.angle, 2); line += ",";
   line += String(GPS.HDOP, 2); line += ",";
+
+  float batt_v = readBatteryVoltage();
+  if (batt_v < 0) line += "-1";
+  else            line += String(batt_v, 2);
+  line += ",";
+
+
   line += String(ttffRecorded ? (int)ttffMs : -1);
   return line;
 }
@@ -316,18 +411,27 @@ static bool parseTime(const String& s, int &hh, int &mm, int &ss, int &ms) {
 }
 
 static bool csvToLineProtocol(const String& csvLine, String &outLP) {
-  // utc_date,utc_time,fix,fixquality,sats,lat,lon,alt_m,speed_mph,course_deg,hdop,ttff_ms
-  String p[12];
-  int idx = 0, start = 0;
+  // utc_date,utc_time,fix,fixquality,sats,lat,lon,alt_m,speed_mph,course_deg,hdop,batt_v,ttff_ms
+  String p[13];
+  int idx = 0;
+  int start = 0;
 
-  for (int i = 0; i < (int)csvLine.length() && idx < 12; i++) {
+  for (int i = 0; i < (int)csvLine.length() && idx < 13; i++) {
     char c = csvLine[i];
     if (c == ',' || c == '\n' || c == '\r') {
       p[idx++] = csvLine.substring(start, i);
       start = i + 1;
     }
   }
-  if (idx < 11) return false;
+
+  // Capture last field if line didn't end with newline
+  if (idx < 13 && start < (int)csvLine.length()) {
+    String tail = csvLine.substring(start);
+    tail.trim();
+    if (tail.length()) p[idx++] = tail;
+}
+
+  if (idx < 13) return false;
 
   int y, mo, d, hh, mm, ss, ms;
   if (!parseDate(p[0], y, mo, d)) return false;
@@ -349,12 +453,18 @@ static bool csvToLineProtocol(const String& csvLine, String &outLP) {
   outLP += ",fix="; outLP += p[2];
   outLP += ",fixquality="; outLP += p[3];
   outLP += ",hdop="; outLP += p[10];
-  outLP += ",ttff_ms="; outLP += p[11];
 
+  // batt_v: allow -1 (no battery) — you can choose to omit it instead if you want
+  if (p[11] != "-1" && p[11].length()) {
+    outLP += ",batt_v="; outLP += p[11];
+  }
+
+  outLP += ",ttff_ms="; outLP += p[12];
   outLP += " ";
   outLP += String((unsigned long long)ts_ns);
   return true;
 }
+
 
 // =========================
 // Wi-Fi + HTTP write (verbose)
@@ -455,6 +565,7 @@ static bool uploadTripFile(const String& path) {
     if (line.startsWith("utc_date")) continue;
 
     String lp;
+    // capture last field if line didn't end with newline/comma
     if (csvToLineProtocol(line + "\n", lp)) {
       payload += lp;
       payload += "\n";
@@ -766,11 +877,31 @@ void setup() {
   // Button (SW38 has pull-up onboard)
   pinMode(BUTTON, INPUT);
 
-  if (USE_VBUS_SENSE) {
+  // ADC init (needed for VBUS sense and/or battery monitor)
+  if (USE_VBUS_SENSE || USE_BATT_MONITOR) {
     analogReadResolution(12);
-    pinMode(VBUS_SENSE_PIN, INPUT);
-    Serial.printf("VBUS sense pin: %d thresh: %d\n", VBUS_SENSE_PIN, VBUS_ON_THRESH);
   }
+
+  if (USE_VBUS_SENSE) {
+    pinMode(VBUS_SENSE_PIN, INPUT);
+
+    #if defined(ARDUINO_ARCH_ESP32)
+      analogSetPinAttenuation(VBUS_SENSE_PIN, ADC_11db);
+    #endif
+
+    Serial.printf("VBUS sense pin: %d  ON:%d mV  OFF:%d mV", VBUS_SENSE_PIN, VBUS_ON_MV, VBUS_OFF_MV);
+  }
+
+
+  if (USE_BATT_MONITOR) {
+    pinMode(BATT_MON_PIN, INPUT);
+    #if defined(ARDUINO_ARCH_ESP32)
+      // Widens measurable range on the ESP32 ADC so higher voltages don't clip
+      analogSetPinAttenuation(BATT_MON_PIN, ADC_11db);
+    #endif
+    Serial.printf("Battery monitor pin: %d\n", BATT_MON_PIN);
+  }
+
 
   // FS
   Serial.println("Mounting LittleFS...");
