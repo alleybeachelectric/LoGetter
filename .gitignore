@@ -1,2 +1,2 @@
 # Local secrets (WiFi keys, tokens, etc)
-secrets.h
+secrets.local.h

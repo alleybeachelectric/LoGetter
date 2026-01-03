@@ -43,7 +43,7 @@
 #include "FS.h"
 #include "LittleFS.h"
 
-#include "secrets.h"
+#include "secrets.local.h"
 
 // =========================
 // InfluxDB v2 config
