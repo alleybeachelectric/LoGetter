@@ -39,6 +39,9 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <Preferences.h>
+#include <DNSServer.h>
+#include <WebServer.h>
 #include <HTTPClient.h>
 #include <Adafruit_GPS.h>
 #include <Adafruit_NeoPixel.h>
@@ -46,6 +49,266 @@
 #include "LittleFS.h"
 
 #include "secrets.local.h"      // Rename as "secrets.h" cause I'm too lazy and will accidentally post my secrets.
+
+
+// -----------------------------------------------------------------------------
+// Wi‑Fi Provisioning Portal (SoftAP + Captive DNS + Landing Page)
+// Product policy:
+//   - FIRST BOOT: always start portal and stop (no logging) until provisioned.
+//   - AFTER: never auto-start portal again.
+//   - HARD RESET: user holds BOOT (GPIO0) at power-up to clear creds + provisioned flag.
+// Stores:
+//   - Wi-Fi creds in Preferences namespace "wifi" (keys: ssid, pass)
+//   - Provisioned flag in Preferences namespace "cfg" (key: provisioned)
+// -----------------------------------------------------------------------------
+static const byte  DNS_PORT = 53;
+static DNSServer   g_dns;
+static WebServer   g_web(80);
+static bool        g_provisioning = false;
+
+// BOOT pin on Feather ESP32 V2 is GPIO0 (also NeoPixel data); check it BEFORE driving NeoPixel.
+#ifndef FORCE_PORTAL_PIN
+#define FORCE_PORTAL_PIN 0
+#endif
+#ifndef FORCE_PORTAL_HOLD_MS
+#define FORCE_PORTAL_HOLD_MS 300
+#endif
+
+static String apName() {
+  uint64_t mac = ESP.getEfuseMac();
+  char buf[32];
+  snprintf(buf, sizeof(buf), "LoGetter-%04X", (uint16_t)(mac & 0xFFFF));
+  return String(buf);
+}
+
+static const char SETUP_HTML[] PROGMEM = R"HTML(
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LoGetter Setup</title>
+  <style>
+    :root { font-family: -apple-system, system-ui, Segoe UI, Roboto, Arial; }
+    body { margin:0; background:#0b0f19; color:#e8eefc; }
+    .wrap { max-width:420px; margin:0 auto; padding:24px; }
+    .card { background:#121a2a; border:1px solid #1f2a44; border-radius:16px; padding:18px; box-shadow: 0 8px 24px rgba(0,0,0,.35);}
+    h1 { font-size:22px; margin:0 0 6px; }
+    p { opacity:.85; line-height:1.35; margin:0 0 14px; }
+    label { display:block; font-size:13px; opacity:.85; margin:10px 0 6px; }
+    input, select { width:100%; padding:12px; border-radius:12px; border:1px solid #2a385c; background:#0b1222; color:#e8eefc; }
+    button { width:100%; margin-top:14px; padding:12px; border-radius:12px; border:0; background:#4c7dff; color:#fff; font-weight:600; }
+    .hint { font-size:12px; opacity:.7; margin-top:10px; }
+    .row { display:flex; gap:10px; }
+    .row > * { flex:1; }
+    .small { font-size:12px; opacity:.75; margin-top:6px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Set up LoGetter</h1>
+      <p>Enter your Wi‑Fi details so LoGetter can upload trips when you're parked.</p>
+
+      <form method="POST" action="/save" autocomplete="on">
+        <label for="ssid">Wi‑Fi network (SSID)</label>
+        <input id="ssid" name="ssid" placeholder="e.g. MyHomeWiFi" required />
+
+        <div class="row">
+          <div>
+            <label for="pass">Wi‑Fi password</label>
+            <input id="pass" name="pass" type="password" placeholder="Password" />
+          </div>
+          <div>
+            <label for="show">Show</label>
+            <select id="show" onchange="togglePass()">
+              <option value="0" selected>Hidden</option>
+              <option value="1">Visible</option>
+            </select>
+          </div>
+        </div>
+
+        <button type="submit">Save &amp; Connect</button>
+      </form>
+
+      <div class="hint">Tip: If your Wi‑Fi has no password, leave it blank.</div>
+      <div class="small">If this page doesn't pop up automatically, open <b>http://192.168.4.1</b></div>
+    </div>
+  </div>
+
+<script>
+function togglePass() {
+  var sel = document.getElementById('show');
+  var p = document.getElementById('pass');
+  p.type = (sel.value === '1') ? 'text' : 'password';
+}
+</script>
+</body>
+</html>
+)HTML";
+
+// ---- NVS helpers ----
+static bool wifiHaveSaved(String &ssid, String &pass) {
+  Preferences p;
+  p.begin("wifi", true);
+  ssid = p.getString("ssid", "");
+  pass = p.getString("pass", "");
+  p.end();
+  return ssid.length() > 0;
+}
+
+static void wifiSave(const String &ssid, const String &pass) {
+  Preferences p;
+  p.begin("wifi", false);
+  p.putString("ssid", ssid);
+  p.putString("pass", pass);
+  p.end();
+}
+
+static void wifiClearSaved() {
+  Preferences p;
+  p.begin("wifi", false);
+  p.clear();
+  p.end();
+}
+
+static bool isProvisioned() {
+  Preferences p;
+  p.begin("cfg", true);
+  bool v = p.getBool("provisioned", false);
+  p.end();
+  return v;
+}
+
+static void setProvisioned(bool v) {
+  Preferences p;
+  p.begin("cfg", false);
+  p.putBool("provisioned", v);
+  p.end();
+}
+
+static void factoryResetProvisioning() {
+  Serial.println("Factory reset: clearing saved Wi-Fi creds + provisioning flag.");
+  wifiClearSaved();
+  setProvisioned(false);
+}
+
+// ---- Wi-Fi connect (STA) ----
+static bool wifiTryConnect(const String& ssid, const String& pass, uint32_t timeoutMs) {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.disconnect(true, true);
+  delay(100);
+
+  WiFi.begin(ssid.c_str(), pass.c_str());
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
+    delay(250);
+    yield();
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// ---- Force-portal input ----
+static bool shouldForcePortalAtBoot() {
+  pinMode(FORCE_PORTAL_PIN, INPUT_PULLUP);
+  delay(FORCE_PORTAL_HOLD_MS);
+  return digitalRead(FORCE_PORTAL_PIN) == LOW;
+}
+
+// ---- Web handlers ----
+static void portalHandleRoot() {
+  g_web.send_P(200, "text/html", SETUP_HTML);
+}
+
+static void portalHandleSave() {
+  String ssid = g_web.arg("ssid");
+  String pass = g_web.arg("pass");
+  ssid.trim();
+
+  if (ssid.length() == 0) {
+    g_web.send(400, "text/plain", "Missing SSID");
+    return;
+  }
+
+  // Save then test connect
+  wifiSave(ssid, pass);
+
+  bool ok = wifiTryConnect(ssid, pass, 15000);
+  if (ok) {
+    setProvisioned(true);
+
+    String msg = "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                 "<style>body{font-family:-apple-system,system-ui;margin:24px;}</style>"
+                 "<h2>Connected ✅</h2>"
+                 "<p>LoGetter connected to <b>" + ssid + "</b>.<br/>You can close this page.</p>";
+    g_web.send(200, "text/html", msg);
+    delay(1200);
+    ESP.restart();
+  } else {
+    g_web.send(200, "text/html",
+      "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<style>body{font-family:-apple-system,system-ui;margin:24px;}</style>"
+      "<h2>Couldn't connect</h2><p>Check the password and try again.</p><p><a href='/'>Back</a></p>");
+    // stay in AP mode
+    WiFi.mode(WIFI_AP);
+  }
+}
+
+static void portalHandleNotFound() {
+  g_web.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  g_web.sendHeader("Pragma", "no-cache");
+  g_web.sendHeader("Expires", "-1");
+  g_web.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
+  g_web.send(302, "text/plain", "");
+}
+
+
+static void startProvisioningPortal() {
+  g_provisioning = true;
+
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+
+  // Deterministic portal IP
+  IPAddress apIP(192,168,4,1);
+  IPAddress netMsk(255,255,255,0);
+
+  String name = apName();
+  WiFi.softAPConfig(apIP, apIP, netMsk);
+  delay(150); // give AP stack a moment to come up
+  bool ok = WiFi.softAP(name.c_str());
+
+  Serial.println();
+  Serial.println("=== Provisioning Mode ===");
+  Serial.printf("softAP() ok: %d\n", (int)ok);
+  Serial.print("AP SSID: "); Serial.println(name);
+  Serial.print("AP IP:   "); Serial.println(WiFi.softAPIP());
+  Serial.println("If captive portal doesn't open, browse to http://192.168.4.1");
+
+  g_dns.start(DNS_PORT, "*", WiFi.softAPIP());
+
+  g_web.on("/", HTTP_GET, portalHandleRoot);
+  g_web.on("/save", HTTP_POST, portalHandleSave);
+  
+
+    // Captive portal detection endpoints (iOS/macOS/Android/Windows)
+  g_web.on("/generate_204", HTTP_GET, portalHandleRoot);          // Android sometimes hits this
+  g_web.on("/gen_204",      HTTP_GET, portalHandleRoot);          // Android variant
+  g_web.on("/hotspot-detect.html", HTTP_GET, portalHandleRoot);   // iOS/macOS
+  g_web.on("/library/test/success.html", HTTP_GET, portalHandleRoot); // iOS/macOS
+  g_web.on("/ncsi.txt", HTTP_GET, portalHandleRoot);             // Windows
+  g_web.on("/connecttest.txt", HTTP_GET, portalHandleRoot);      // Windows
+  g_web.on("/redirect", HTTP_GET, portalHandleRoot);             // common
+
+  // Anything else -> root
+  g_web.onNotFound(portalHandleNotFound);
+  g_web.begin();
+}
+// -----------------------------------------------------------------------------
+// End provisioning portal
+// -----------------------------------------------------------------------------
+
 
 // =========================
 // InfluxDB v2 config
@@ -472,29 +735,33 @@ static bool csvToLineProtocol(const String& csvLine, String &outLP) {
 static bool wifiConnectVerbose() {
   Serial.println();
   Serial.println("=== WiFi Connect ===");
-  Serial.printf("SSID: %s\n", WIFI_SSID);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
-    pixelBlink(rgb(255, 0, 0), 80, 80, 30); // red blink while connecting
-    Serial.print(".");
-    delay(250);
-    yield();
+  // Product behavior:
+  //   - Only connect using credentials saved via provisioning portal (Preferences/NVS).
+  //   - Never auto-start the portal from here (first-boot only).
+  if (g_provisioning) {
+    Serial.println("Provisioning active; Wi-Fi connect deferred.");
+    return false;
   }
-  Serial.println();
 
-  if (WiFi.status() == WL_CONNECTED) {
+  String ssid, pass;
+  if (!wifiHaveSaved(ssid, pass)) {
+    Serial.println("No saved Wi-Fi credentials.");
+    return false;
+  }
+
+  Serial.printf("SSID: %s", ssid.c_str());
+
+  bool ok = wifiTryConnect(ssid, pass, WIFI_CONNECT_TIMEOUT_MS);
+
+  if (ok) {
     pixelSolid(rgb(0, 255, 0), 25); // green solid: connected
-    Serial.printf("WiFi connected! IP: %s RSSI: %d dBm\n",
-                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    Serial.printf("WiFi connected! IP: %s RSSI: %d dBm", WiFi.localIP().toString().c_str(), WiFi.RSSI());
     return true;
   }
 
   pixelSolid(rgb(255, 0, 0), 60); // solid red: failed
-  Serial.println("WiFi connect FAILED.");
+  Serial.println("WiFi connect FAILED. (No portal fallback)");
   return false;
 }
 
@@ -850,8 +1117,30 @@ static void handleButton() {
 // Setup / Loop
 // =========================
 void setup() {
+  delay(300); // helps USB-serial auto-reset on some setups
+
   Serial.begin(115200);
   delay(250);
+
+
+  // ---------------------------------------------------------------------------
+  // Provisioning policy:
+  //   - FIRST BOOT: always start AP portal.
+  //   - AFTER provisioning: never auto-start portal again.
+  //   - HARD RESET: hold BOOT (GPIO0) at power-up to clear creds + provisioned flag.
+  // ---------------------------------------------------------------------------
+
+  // If user is holding BOOT at boot, treat it as a hard reset request.
+  if (shouldForcePortalAtBoot()) {
+    factoryResetProvisioning();
+  }
+
+  // FIRST BOOT behavior: start portal immediately and stop normal startup.
+  if (!isProvisioned()) {
+    Serial.println("First boot (not provisioned) -> starting Wi-Fi provisioning portal");
+    startProvisioningPortal();
+    return; // IMPORTANT: don't continue into logger mode
+  }
 
   Serial.println();
   Serial.println("======================================");
@@ -930,6 +1219,14 @@ void setup() {
 }
 
 void loop() {
+  if (g_provisioning) {
+    g_dns.processNextRequest();
+    g_web.handleClient();
+    delay(1);
+    return;
+  }
+
+
   // Button can force upload/sleep
   handleButton();
 
