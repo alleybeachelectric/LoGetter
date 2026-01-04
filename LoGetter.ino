@@ -39,6 +39,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <Preferences.h>
 #include <DNSServer.h>
 #include <WebServer.h>
@@ -313,16 +314,19 @@ static void startProvisioningPortal() {
 // =========================
 // InfluxDB v2 config
 // =========================
-static const char* INFLUX_HOST      = "http://10.0.1.13:8086"; // your server
+static const char* INFLUX_BASE_URL  = "https://influx.eggseax.com"; // your server
 static const char* INFLUX_ORG       = "lab";                   // your org name
 static const char* INFLUX_BUCKET    = "car_trips";             // your bucket name
 static const char* INFLUX_PRECISION = "ns";                    // keep ns
 static const char* DEVICE_TAG       = "car1";                  // optional tag to distinguish devices
 
 static String influxWriteUrl() {
-  return String(INFLUX_HOST) + "/api/v2/write?org=" + INFLUX_ORG +
-         "&bucket=" + INFLUX_BUCKET + "&precision=" + INFLUX_PRECISION;
+  return String(INFLUX_BASE_URL) +
+         "/api/v2/write?org=" + INFLUX_ORG +
+         "&bucket=" + INFLUX_BUCKET +
+         "&precision=" + INFLUX_PRECISION;
 }
+
 
 // =========================
 // GPS UART pins (your wiring)
@@ -408,6 +412,18 @@ static const uint32_t SLEEP_SECONDS = 120;   // wake every 2 min and try again (
 // State
 // =========================
 String currentTripPath;
+String currentTripId;   // filename stem, used as Influx tag
+
+// Derive a stable trip_id from a trip file path like '/trips/trip_YYYY-MM-DD_HH-MM-SS.csv'
+// Result: 'trip_YYYY-MM-DD_HH-MM-SS' (no directory, no extension).
+static String tripIdFromPath(const String& path) {
+  int slash = path.lastIndexOf('/');
+  int start = (slash >= 0) ? (slash + 1) : 0;
+  int dot = path.lastIndexOf('.');
+  int end = (dot > start) ? dot : path.length();
+  return path.substring(start, end);
+}
+
 bool tripRenamed = false;
 
 uint32_t lastLogMs = 0;
@@ -557,7 +573,17 @@ static void maybeRenameTripFile() {
   if (LittleFS.rename(currentTripPath, newPath)) {
     currentTripPath = newPath;
     tripRenamed = true;
+
+    // keep trip_id in sync with final filename
+    currentTripId = currentTripPath;
+    int slash = currentTripId.lastIndexOf('/');
+    if (slash >= 0) currentTripId = currentTripId.substring(slash + 1);
+    if (currentTripId.endsWith(".csv")) currentTripId.remove(currentTripId.length() - 4);
+
     Serial.println("Rename: OK");
+  // Keep trip_id in sync with the final on-disk filename.
+  currentTripId = tripIdFromPath(newPath);
+
   } else {
     Serial.println("Rename: FAILED (will retry)");
   }
@@ -703,8 +729,11 @@ static bool csvToLineProtocol(const String& csvLine, String &outLP) {
   uint64_t ts_ns;
   if (!ymdhms_to_epoch_ns(y, mo, d, hh, mm, ss, ms, ts_ns)) return false;
 
-  outLP = "gps";
-  outLP += ",device="; outLP += DEVICE_TAG;
+  outLP.reserve(256);
+  outLP = "gps,device=";
+  outLP += DEVICE_TAG;
+  outLP += ",trip_id=";
+  outLP += currentTripId;
 
   // Fields (numeric)
   outLP += " lat="; outLP += p[5];
@@ -773,13 +802,15 @@ static bool influxPostVerbose(const String& payload) {
   Serial.printf("URL: %s\n", url.c_str());
   Serial.printf("Bytes: %d\n", (int)payload.length());
 
-  WiFiClient client;
-  client.setTimeout(5000); // 5s socket read timeout
+  WiFiClientSecure client;
+  client.setInsecure();          // ok for now with Cloudflare
+  client.setTimeout(12000);     // wait
 
   HTTPClient http;
-  http.setTimeout(7000);   // 7s overall
+  http.setTimeout(15000);   // 15s overall
   http.setReuse(false);    // IMPORTANT: don't keep sockets open between requests
 
+  // IMPORTANT: this must be the overload that accepts (client, url)
   if (!http.begin(client, url)) {
     Serial.println("HTTP begin() failed");
     return false;
@@ -807,6 +838,10 @@ static bool influxPostVerbose(const String& payload) {
 
 
 static bool uploadTripFile(const String& path) {
+  // Tag all points from this file with a stable trip_id derived from the filename.
+  currentTripId = tripIdFromPath(path);
+  Serial.printf("Trip ID (upload): %s\n", currentTripId.c_str());
+
   Serial.println();
   Serial.println("=== Upload Trip File ===");
   Serial.printf("File: %s\n", path.c_str());
@@ -975,6 +1010,12 @@ static void startNewTrip() {
   stoppedSinceMs = 0;
 
   currentTripPath = makeTripBootFilename();
+
+  // trip_id = filename without directory + extension
+  currentTripId = currentTripPath;
+  int slash = currentTripId.lastIndexOf('/');
+  if (slash >= 0) currentTripId = currentTripId.substring(slash + 1);
+  if (currentTripId.endsWith(".csv")) currentTripId.remove(currentTripId.length() - 4);
 
   Serial.println();
   Serial.println("=== Trip Start ===");
@@ -1146,10 +1187,10 @@ void setup() {
   Serial.println("======================================");
   Serial.println(" LoGetter v1: GPS Trip Logger -> Influx");
   Serial.println("======================================");
-  Serial.printf("Influx host: %s\n", INFLUX_HOST);
-  Serial.printf("Org: %s  Bucket: %s\n", INFLUX_ORG, INFLUX_BUCKET);
-  Serial.printf("Write URL: %s\n", influxWriteUrl().c_str());
-  Serial.printf("Device tag: %s\n", DEVICE_TAG);
+  Serial.printf("Influx URL : %s\n", INFLUX_BASE_URL);
+  Serial.printf("Org        : %s\n", INFLUX_ORG);
+  Serial.printf("Bucket     : %s\n", INFLUX_BUCKET);
+  Serial.printf("Device tag : %s\n", DEVICE_TAG);
   Serial.printf("VBUS sense enabled: %d\n", USE_VBUS_SENSE);
 
   // NeoPixel power enable + init
