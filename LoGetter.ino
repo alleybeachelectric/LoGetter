@@ -193,6 +193,24 @@ static void factoryResetProvisioning() {
   setProvisioned(false);
 }
 
+// ---- Trip number helpers (for Grafana color coding) ----
+static uint32_t getTripNumber() {
+  Preferences p;
+  p.begin("trip", true);
+  uint32_t num = p.getUInt("number", 0);
+  p.end();
+  return num;
+}
+
+static void incrementTripNumber() {
+  Preferences p;
+  p.begin("trip", false);
+  uint32_t num = p.getUInt("number", 0);
+  num++;
+  p.putUInt("number", num);
+  p.end();
+}
+
 // ---- Wi-Fi connect (STA) ----
 static bool wifiTryConnect(const String& ssid, const String& pass, uint32_t timeoutMs) {
   WiFi.mode(WIFI_STA);
@@ -314,11 +332,11 @@ static void startProvisioningPortal() {
 // =========================
 // InfluxDB v2 config
 // =========================
-static const char* INFLUX_BASE_URL  = "https://influx.eggseax.com"; // your server
-static const char* INFLUX_ORG       = "lab";                   // your org name
-static const char* INFLUX_BUCKET    = "car_trips";             // your bucket name
+// static const char* INFLUX_BASE_URL  = "https://influx.eggseax.com"; // your server
+// static const char* INFLUX_ORG       = "lab";                   // your org name
+// static const char* INFLUX_BUCKET    = "car_trips";             // your bucket name
 static const char* INFLUX_PRECISION = "ns";                    // keep ns
-static const char* DEVICE_TAG       = "car1";                  // optional tag to distinguish devices
+static const char* DEVICE_TAG       = "logetter_v3";                  // optional tag to distinguish devices
 
 static String influxWriteUrl() {
   return String(INFLUX_BASE_URL) +
@@ -363,7 +381,7 @@ static const uint32_t BTN_LONGPRESS_MS  = 1500;
 // =========================
 // Storage + trip behavior
 // =========================
-static const char* TRIP_DIR = "/trips";
+// static const char* TRIP_DIR = "/trips";
 static const uint32_t LOG_PERIOD_MS = 1000;  // 1Hz
 
 // Trip end conditions
@@ -413,6 +431,7 @@ static const uint32_t SLEEP_SECONDS = 120;   // wake every 2 min and try again (
 // =========================
 String currentTripPath;
 String currentTripId;   // filename stem, used as Influx tag
+uint32_t currentTripNumber = 0;  // Auto-incrementing trip number for Grafana color coding
 
 // Derive a stable trip_id from a trip file path like '/trips/trip_YYYY-MM-DD_HH-MM-SS.csv'
 // Result: 'trip_YYYY-MM-DD_HH-MM-SS' (no directory, no extension).
@@ -550,7 +569,7 @@ static String makeTripFilenameFromGPS() {
 
 static void writeHeaderIfNew(File &f) {
   if (f.size() == 0) {
-    f.println("utc_date,utc_time,fix,fixquality,sats,lat,lon,alt_m,speed_mph,course_deg,hdop,batt_v,ttff_ms");
+    f.println("utc_date,utc_time,fix,fixquality,sats,lat,lon,alt_m,speed_mph,course_deg,hdop,batt_v,ttff_ms,trip_number");
   }
 }
 
@@ -574,16 +593,10 @@ static void maybeRenameTripFile() {
     currentTripPath = newPath;
     tripRenamed = true;
 
-    // keep trip_id in sync with final filename
-    currentTripId = currentTripPath;
-    int slash = currentTripId.lastIndexOf('/');
-    if (slash >= 0) currentTripId = currentTripId.substring(slash + 1);
-    if (currentTripId.endsWith(".csv")) currentTripId.remove(currentTripId.length() - 4);
+    // Keep trip_id in sync with the final on-disk filename.
+    currentTripId = tripIdFromPath(newPath);
 
     Serial.println("Rename: OK");
-  // Keep trip_id in sync with the final on-disk filename.
-  currentTripId = tripIdFromPath(newPath);
-
   } else {
     Serial.println("Rename: FAILED (will retry)");
   }
@@ -670,8 +683,9 @@ static String buildCsvLine() {
   else            line += String(batt_v, 2);
   line += ",";
 
-
   line += String(ttffRecorded ? (int)ttffMs : -1);
+  line += ",";
+  line += String(currentTripNumber);
   return line;
 }
 
@@ -699,13 +713,13 @@ static bool parseTime(const String& s, int &hh, int &mm, int &ss, int &ms) {
   return true;
 }
 
-static bool csvToLineProtocol(const String& csvLine, String &outLP) {
-  // utc_date,utc_time,fix,fixquality,sats,lat,lon,alt_m,speed_mph,course_deg,hdop,batt_v,ttff_ms
-  String p[13];
+ static bool csvToLineProtocol(const String& csvLine, String &outLP) {
+  // utc_date,utc_time,fix,fixquality,sats,lat,lon,alt_m,speed_mph,course_deg,hdop,batt_v,ttff_ms,trip_number
+  String p[14];
   int idx = 0;
   int start = 0;
 
-  for (int i = 0; i < (int)csvLine.length() && idx < 13; i++) {
+  for (int i = 0; i < (int)csvLine.length() && idx < 14; i++) {
     char c = csvLine[i];
     if (c == ',' || c == '\n' || c == '\r') {
       p[idx++] = csvLine.substring(start, i);
@@ -713,14 +727,16 @@ static bool csvToLineProtocol(const String& csvLine, String &outLP) {
     }
   }
 
-  // Capture last field if line didn't end with newline
-  if (idx < 13 && start < (int)csvLine.length()) {
+  // Always capture last field
+  if (idx < 14) {
     String tail = csvLine.substring(start);
     tail.trim();
-    if (tail.length()) p[idx++] = tail;
-}
+    p[idx++] = tail;
+  }
 
-  if (idx < 13) return false;
+  // Must be exactly 14 fields, and trip_number must exist
+  if (idx != 14) return false;
+  if (p[13].length() == 0) return false;
 
   int y, mo, d, hh, mm, ss, ms;
   if (!parseDate(p[0], y, mo, d)) return false;
@@ -729,29 +745,37 @@ static bool csvToLineProtocol(const String& csvLine, String &outLP) {
   uint64_t ts_ns;
   if (!ymdhms_to_epoch_ns(y, mo, d, hh, mm, ss, ms, ts_ns)) return false;
 
+  outLP = "";
   outLP.reserve(256);
+
   outLP = "gps,device=";
   outLP += DEVICE_TAG;
   outLP += ",trip_id=";
   outLP += currentTripId;
 
-  // Fields (numeric)
-  outLP += " lat="; outLP += p[5];
-  outLP += ",lon="; outLP += p[6];
-  outLP += ",alt_m="; outLP += p[7];
-  outLP += ",speed_mph="; outLP += p[8];
+  // float fields
+  outLP += " lat=";        outLP += p[5];
+  outLP += ",lon=";        outLP += p[6];
+  outLP += ",alt_m=";      outLP += p[7];
+  outLP += ",speed_mph=";  outLP += p[8];
   outLP += ",course_deg="; outLP += p[9];
-  outLP += ",sats="; outLP += p[4];
-  outLP += ",fix="; outLP += p[2];
-  outLP += ",fixquality="; outLP += p[3];
-  outLP += ",hdop="; outLP += p[10];
+  outLP += ",hdop=";       outLP += p[10];
 
-  // batt_v: allow -1 (no battery) — you can choose to omit it instead if you want
+  // optional float
   if (p[11] != "-1" && p[11].length()) {
     outLP += ",batt_v="; outLP += p[11];
   }
 
-  outLP += ",ttff_ms="; outLP += p[12];
+  // numeric fields (InfluxDB will infer type)
+  if (p[4].length())  { outLP += ",sats=";       outLP += p[4]; }
+  if (p[2].length())  { outLP += ",fix=";        outLP += p[2]; }
+  if (p[3].length())  { outLP += ",fixquality="; outLP += p[3]; }
+  if (p[12].length()) { outLP += ",ttff_ms=";    outLP += p[12]; }
+
+  // required field
+  outLP += ",trip_number="; outLP += p[13];
+
+
   outLP += " ";
   outLP += String((unsigned long long)ts_ns);
   return true;
@@ -953,7 +977,7 @@ static void uploadAllTrips() {
     // ensure leading "/"
     if (!path.startsWith("/")) path = String("/") + path;
 
-    // ensure it’s inside /trips
+    // ensure it's inside /trips
     if (!path.startsWith(String(TRIP_DIR) + "/")) {
       String base = path;
       int slash = base.lastIndexOf('/');
@@ -982,7 +1006,7 @@ static void uploadAllTrips() {
 static void goToSleep(uint32_t seconds) {
   Serial.println();
   Serial.println("=== Sleep ===");
-  Serial.printf("Sleeping for %lu seconds\n", (unsigned long)seconds);
+  Serial.println("Will wake when VBUS goes HIGH (car starts)");
 
   uint32_t t0 = millis();
   while (millis() - t0 < 900) {
@@ -995,7 +1019,8 @@ static void goToSleep(uint32_t seconds) {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 
-  esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+  // Wake on VBUS HIGH (car starts) instead of timer
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)VBUS_SENSE_PIN, 1);
   esp_deep_sleep_start();
 }
 
@@ -1003,6 +1028,10 @@ static void goToSleep(uint32_t seconds) {
 // Trip control + logging
 // =========================
 static void startNewTrip() {
+  // Get and increment trip number for Grafana color coding
+  currentTripNumber = getTripNumber();
+  incrementTripNumber();
+  
   tripRenamed = false;
   ttffRecorded = false;
   ttffMs = 0;
@@ -1020,12 +1049,34 @@ static void startNewTrip() {
   Serial.println();
   Serial.println("=== Trip Start ===");
   Serial.printf("Trip file: %s\n", currentTripPath.c_str());
+  Serial.printf("Trip number: %lu\n", (unsigned long)currentTripNumber);
 }
 
 static bool shouldEndTrip() {
   if (USE_VBUS_SENSE) {
-    return !carPowerPresent();
+    static bool vbusWasHigh = false;
+    static bool initialized = false;
+    
+    bool vbusNow = carPowerPresent();
+    
+    // Initialize on first call
+    if (!initialized) {
+      vbusWasHigh = vbusNow;
+      initialized = true;
+    }
+    
+    // Detect VBUS HIGH -> LOW transition (car turned off)
+    if (vbusWasHigh && !vbusNow) {
+      Serial.println("=== VBUS LOST (Car turned off) ===");
+      vbusWasHigh = false;
+      return true;
+    }
+    
+    vbusWasHigh = vbusNow;
+    return false;
   }
+  
+  // Fallback: speed-based detection
   if (stoppedSinceMs == 0) return false;
   uint32_t stoppedFor = (millis() - stoppedSinceMs) / 1000;
   return stoppedFor >= STOP_HOLD_SEC;
